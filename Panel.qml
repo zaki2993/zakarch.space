@@ -162,6 +162,7 @@ Panel {
   }
 
   function setTargets(list, on) {
+    if (cleaning) return
     var next = Object.assign({}, sel)
     for (var i = 0; i < list.length; i++) {
       var t = list[i]
@@ -174,6 +175,7 @@ Panel {
   function toggleTarget(t) { setTargets([t], checkState(t) !== "all") }
 
   function toggleItem(t, item) {
+    if (cleaning) return
     var next = Object.assign({}, sel)
     var key = itemKey(t, item)
     next[key] = !next[key]
@@ -442,13 +444,12 @@ Panel {
     }
   }
 
-  BarIconButton {
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     readonly property bool withLabel: root.showFreeSpace && !(root.bar && root.bar.vertical) && root.diskSize > 0
     text: withLabel ? "󰋊 " + root.gb(root.diskAvail) + "G" : "󰋊"
-    slotSize: Style.bar.iconSlot * (withLabel ? 2.4 : 1)
     foreground: root.low ? root.urgent : root.barForeground
     tooltipText: root.diskSize > 0 ? root.gb(root.diskAvail) + " GB free of " + root.gb(root.diskSize) + " GB" : "Disk space"
     onPressed: function(b) {
@@ -917,7 +918,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         Layout.alignment: Qt.AlignVCenter
-        text: (trow.t.estimate ? "≤ " : "") + root.human(trow.mark === "some" ? root.pickedKb(trow.t) : trow.t.kb)
+        text: (trow.t.estimate ? "≤ " : "") + root.human(trow.mark === "none" ? trow.t.kb : root.pickedKb(trow.t))
         color: trow.mark === "none" ? root.dim : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
