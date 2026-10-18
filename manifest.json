@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "id": "zakarch.space",
+  "name": "Disk Space",
+  "version": "1.0.0",
+  "author": "zakaryae",
+  "license": "MIT",
+  "description": "Free disk space safely: caches, old trash, stale project build files, plus a guided sudo cleanup for journals, crash dumps, package cache and snapshots.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Disk Space",
+    "description": "Free space on / in the bar; click for a checklist of safe cleanups with sizes.",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "aliases": [
+      "disk",
+      "storage",
+      "cleaner"
+    ],
+    "defaults": {
+      "showFreeSpace": "On",
+      "warnFreeGB": 10,
+      "staleDays": 30,
+      "scanRoots": "~"
+    },
+    "schema": [
+      {
+        "key": "showFreeSpace",
+        "type": "enum",
+        "label": "Show free space in the bar",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On"
+      },
+      {
+        "key": "warnFreeGB",
+        "type": "integer",
+        "label": "Warn below (GB free)",
+        "min": 1,
+        "max": 500,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "The icon turns red and a notification is sent once when free space drops below this."
+      },
+      {
+        "key": "staleDays",
+        "type": "integer",
+        "label": "Stale project age (days)",
+        "min": 7,
+        "max": 365,
+        "step": 1,
+        "defaultValue": 30,
+        "description": "Project build files are only offered for cleanup when nothing in the project changed for this long."
+      },
+      {
+        "key": "scanRoots",
+        "type": "string",
+        "label": "Project folders to scan",
+        "defaultValue": "~",
+        "description": "Colon-separated folders searched for stale node_modules, .next, target, venvs... Hidden folders are never searched."
+      }
+    ]
+  }
+}
