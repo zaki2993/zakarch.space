@@ -51,7 +51,7 @@ This plugin deletes files, so it's built to be conservative:
 - Tool commands (`uv cache clean`, `go clean`, …) only run when that tool's cache is inside
   `$HOME`.
 - A project's build files only count as stale when **all** of these are true:
-  - nothing in the project (or its enclosing git repo) has changed for *stale days*: its files, the targets of its symlinks, and its git index (worktrees included)
+  - nothing in the project (or its enclosing git repo) has changed for *stale days*: its files, everything its symlinks point to (inside linked folders too), and its git index (worktrees included). Only real build output is skipped, so a source folder like `src/build` still counts. Anything that can't be checked counts as active.
   - no process is running inside it
   - its manifest is present: `package.json` plus a lockfile for `node_modules`, a `pyproject.toml` / `requirements*.txt` / … for venvs, `Cargo.toml` / `pom.xml` for `target`
 

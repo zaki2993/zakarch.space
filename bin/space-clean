@@ -208,7 +208,7 @@ remove_trash_item() {
 }
 clean_item_trash-old() { remove_trash_item "$1"; }
 clean_item_trash-all() { remove_trash_item "$1"; }
-after_clean_trash-all() { [[ -d "$TRASH/expunged" ]] && empty_dir "$TRASH/expunged"; true; }
+after_clean_trash-all() { [[ -d "$TRASH/expunged" ]] || return 0; empty_dir "$TRASH/expunged"; }
 
 # Browsers: process name|cache dir|display name
 BROWSERS=(
@@ -242,6 +242,7 @@ clean_item_browser-cache() {
     if [[ "$dir" == "$1" ]]; then
       browser_open "$proc" && { echo "skip $name: it is running" >&2; return 0; }
       empty_dir "$dir"
+      return
     fi
   done
 }
@@ -261,7 +262,17 @@ items_codex-old() {
     done
   done
 }
-clean_item_codex-old() { remove_dir "$1"; }
+# Codex may have switched releases since the scan, so check again first.
+clean_item_codex-old() {
+  local rel="$1" cur
+  cur=$(realpath -e -- "$(dirname -- "$(dirname -- "$rel")")/current" 2>/dev/null)
+  PROC_PATHS=""
+  if [[ -z "$cur" || "$cur" == "$rel" ]] || in_use "$rel"; then
+    echo "skip codex $(basename -- "$rel"): it is current or running now" >&2
+    return 0
+  fi
+  remove_dir "$rel"
+}
 
 # ---------------------------------------------------------------------------
 # Tool-command targets: measured by their cache dirs, cleaned by the tool.
@@ -414,11 +425,23 @@ project_scope() {
   echo "$1"
 }
 
-ARTIFACT_PRUNE=()
-for n in "${BUILD_NAMES[@]}" "${DEP_NAMES[@]}" "${VENV_NAMES[@]}" .git; do
-  ARTIFACT_PRUNE+=(-name "$n" -o)
+ARTIFACT_NAMES=()
+for n in "${BUILD_NAMES[@]}" "${DEP_NAMES[@]}" "${VENV_NAMES[@]}"; do
+  ARTIFACT_NAMES+=(-name "$n" -o)
 done
-unset 'ARTIFACT_PRUNE[-1]'
+unset 'ARTIFACT_NAMES[-1]'
+
+# Sets PRUNE to find arguments that skip .git and this project's real build
+# output. A folder that only shares the name, like src/build, is still checked.
+PRUNE=()
+set_project_prune() {
+  local scope="$1" dir
+  PRUNE=(-name .git)
+  while IFS= read -r -d '' dir; do
+    classify "$dir" >/dev/null || continue
+    PRUNE+=(-o -path "$(printf '%s' "$dir" | sed 's/[][*?\\]/\\&/g')")
+  done < <(find "$scope" -xdev -name .git -prune -o -type d \( "${ARTIFACT_NAMES[@]}" \) -print0 -prune 2>/dev/null)
+}
 
 # This checkout's git index. A linked worktree keeps it in the main repo.
 git_index() {
@@ -433,14 +456,22 @@ git_index() {
   [[ -f "$idx" ]] && echo "$idx"
 }
 
-# Newest change in the project as epoch seconds: its files, the targets of
-# its symlinks and its git index. Build output folders don't count.
+# Newest change in the project as epoch seconds: its files, what its
+# symlinks point to (everything inside a linked folder) and its git index.
+# Build output doesn't count. Anything we can't check counts as "now".
 project_newest() {
-  local scope="$1" idx
+  local scope="$1" idx link folders=0
   {
-    find "$scope" -xdev \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type f -printf '%T@\n' 2>/dev/null
-    find "$scope" -xdev \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type l -print0 2>/dev/null |
-      xargs -0r stat -L -c %Y 2>/dev/null
+    find "$scope" -xdev \( "${PRUNE[@]}" \) -prune -o -type f -printf '%T@\n' 2>/dev/null
+    while IFS= read -r -d '' link; do
+      if [[ -d "$link" ]]; then
+        # Too many linked folders, a slow one or an unreadable one: assume active.
+        if (( ++folders > 20 )); then date +%s; break; fi
+        timeout 20 find -L "$link" -type f -printf '%T@\n' 2>/dev/null || date +%s
+      else
+        stat -L -c %Y -- "$link" 2>/dev/null || date +%s
+      fi
+    done < <(find "$scope" -xdev \( "${PRUNE[@]}" \) -prune -o -type l -print0 2>/dev/null)
     idx=$(git_index "$scope") && stat -c %Y "$idx"
   } | sort -n | tail -n 1
 }
@@ -450,8 +481,9 @@ project_newest() {
 project_stale() {
   local scope="$1" newest cutoff
   in_use "$scope" && return 1
+  set_project_prune "$scope"
   # Fast path for busy projects: any recent plain file settles it.
-  [[ -n $(find "$scope" -xdev \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type f -mtime "-$STALE_DAYS" -print -quit 2>/dev/null) ]] && return 1
+  [[ -n $(find "$scope" -xdev \( "${PRUNE[@]}" \) -prune -o -type f -mtime "-$STALE_DAYS" -print -quit 2>/dev/null) ]] && return 1
   cutoff=$(date -d "-$STALE_DAYS days" +%s)
   newest=$(project_newest "$scope")
   newest=${newest%.*}
@@ -660,7 +692,7 @@ cmd_clean() {
         after=$(kb "$path")
         freed=$((freed + (before > after ? before - after : 0)))
       done <<<"$list"
-      [[ -z "${picked[$id]-}" ]] && declare -F "after_clean_$id" >/dev/null && "after_clean_$id"
+      if [[ -z "${picked[$id]-}" ]] && declare -F "after_clean_$id" >/dev/null; then "after_clean_$id" || ok=0; fi
     else
       before=$("size_$id" 2>/dev/null) || before=0
       "clean_$id" || ok=0
@@ -781,37 +813,41 @@ prune_snapshots() {
 
 # ---------------------------------------------------------------------------
 
-args=()
-while (($#)); do
-  case "$1" in
-    --json) JSON=1 ;;
-    --dry-run) DRY_RUN=1 ;;
-    --stale-days) shift; STALE_DAYS="${1:-}" ;;
-    --stale-days=*) STALE_DAYS="${1#*=}" ;;
-    --roots) shift; ROOTS="${1:-}" ;;
-    --roots=*) ROOTS="${1#*=}" ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) args+=("$1") ;;
+main() {
+  args=()
+  while (($#)); do
+    case "$1" in
+      --json) JSON=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      --stale-days) shift; STALE_DAYS="${1:-}" ;;
+      --stale-days=*) STALE_DAYS="${1#*=}" ;;
+      --roots) shift; ROOTS="${1:-}" ;;
+      --roots=*) ROOTS="${1#*=}" ;;
+      -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+
+  [[ "$STALE_DAYS" =~ ^[0-9]+$ ]] && ((STALE_DAYS >= 7)) || die "--stale-days must be a number >= 7"
+  ROOTS=${ROOTS//\~/$HOME}
+  roots=()
+  IFS=':' read -ra _roots <<<"$ROOTS"
+  for r in "${_roots[@]}"; do r=$(realpath -e -- "$r" 2>/dev/null) && roots+=("$r"); done
+  ROOTS=$(IFS=':'; echo "${roots[*]-}")
+
+  cmd="${args[0]:-scan}"
+  case "$cmd" in
+    status) cmd_status ;;
+    scan) cmd_scan ;;
+    clean) cmd_clean "${args[@]:1}" ;;
+    ignore) cmd_ignore "${args[1]:-}" ;;
+    unignore) cmd_unignore "${args[1]:-}" ;;
+    ignored) [[ -f "$IGNORE_FILE" ]] && cat "$IGNORE_FILE"; true ;;
+    system) cmd_system ;;
+    list) cmd_list ;;
+    *) die "unknown command: $cmd (try --help)" ;;
   esac
-  shift
-done
+}
 
-[[ "$STALE_DAYS" =~ ^[0-9]+$ ]] && ((STALE_DAYS >= 7)) || die "--stale-days must be a number >= 7"
-ROOTS=${ROOTS//\~/$HOME}
-roots=()
-IFS=':' read -ra _roots <<<"$ROOTS"
-for r in "${_roots[@]}"; do r=$(realpath -e -- "$r" 2>/dev/null) && roots+=("$r"); done
-ROOTS=$(IFS=':'; echo "${roots[*]-}")
-
-cmd="${args[0]:-scan}"
-case "$cmd" in
-  status) cmd_status ;;
-  scan) cmd_scan ;;
-  clean) cmd_clean "${args[@]:1}" ;;
-  ignore) cmd_ignore "${args[1]:-}" ;;
-  unignore) cmd_unignore "${args[1]:-}" ;;
-  ignored) [[ -f "$IGNORE_FILE" ]] && cat "$IGNORE_FILE"; true ;;
-  system) cmd_system ;;
-  list) cmd_list ;;
-  *) die "unknown command: $cmd (try --help)" ;;
-esac
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"

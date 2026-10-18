@@ -944,7 +944,7 @@ Panel {
     topPadding: Style.space(4)
     bottomPadding: Style.space(6)
     wrapMode: Text.WordWrap
-    text: "Showing the largest " + (t.items || []).length + " of " + t.count + ". Clean the rest from the terminal: space-clean clean " + t.id
+    text: "Showing the largest " + (t.items || []).length + " of " + t.count + ". Clean the rest from the terminal: " + root.script + " clean " + t.id
     color: root.dim
     font.family: root.fontFamily
     font.pixelSize: Style.font.caption
