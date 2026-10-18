@@ -15,7 +15,7 @@ from one panel in your bar.
   - unused mise tool versions (`mise prune`)
   - AUR build folders (yay / paru) and thumbnails
   - browser caches, skipping any browser that is open
-  - old Playwright browser builds and old Codex releases
+  - old Codex releases
   - Trash items older than *stale days*
   - stale build output (`.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.angular`,
     Rust/Maven `target`, Gradle `build`)
@@ -46,12 +46,17 @@ This plugin deletes files, so it's built to be conservative:
 - The panel only names targets and folders. `bin/space-clean` finds every path itself right
   before deleting. A folder it didn't find on its own is ignored, so the panel can narrow
   the list but never add to it.
-- Every path must resolve inside `$HOME`, at least two levels deep, and must not be a
-  symlink. Removal uses `rm --one-file-system`, so links are removed and never followed.
+- Every path must be inside `$HOME`, at least two levels deep, with no symlink anywhere in
+  it. Removal uses `rm --one-file-system`, so links are removed and never followed.
+- Tool commands (`uv cache clean`, `go clean`, …) only run when that tool's cache is inside
+  `$HOME`.
 - A project's build files only count as stale when **all** of these are true:
-  - nothing in the project (or its enclosing git repo) has changed for *stale days*, including `.git/index`
+  - nothing in the project (or its enclosing git repo) has changed for *stale days*: its files, the targets of its symlinks, and its git index (worktrees included)
   - no process is running inside it
   - its manifest is present: `package.json` plus a lockfile for `node_modules`, a `pyproject.toml` / `requirements*.txt` / … for venvs, `Cargo.toml` / `pom.xml` for `target`
+
+  All of this is checked again right before each folder is deleted.
+- If deleting a Trash item fails, its restore info is kept. Failures are reported, never shown as success.
 - The project scan never goes into hidden folders, so tools installed under `~/.local` and
   similar are never touched.
 - Nothing runs as root from the panel. `sudo` is only used in the terminal walkthrough.

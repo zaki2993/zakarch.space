@@ -18,12 +18,14 @@
 #     deleted by pattern across the disk.
 #   * `clean` never trusts paths from the caller. It re-discovers every target
 #     itself; an ID=PATH argument can only narrow that list, never add to it.
-#   * Every path must resolve inside $HOME, must not be a symlink, and is
+#   * Every path must be inside $HOME with no symlink anywhere in it, and is
 #     removed with --one-file-system. Each removal is logged.
+#   * Tools' own clean commands only run when their cache is inside $HOME.
 #   * Project build files are only offered when the project is untouched for
 #     --stale-days, no process is running inside it, its manifest
 #     (package.json + lockfile, Cargo.toml, pyproject.toml...) is present, and
-#     it is not on the ignore list.
+#     it is not on the ignore list. All of this is checked again right
+#     before each folder is deleted.
 #   * Browser caches are skipped while that browser is running.
 #   * Anything needing root lives in `system`, which runs in a visible
 #     terminal and asks before every step.
@@ -43,6 +45,8 @@ SCAN_DEPTH=8
 MAX_ITEMS=300
 HOME_REAL=$(realpath -e -- "$HOME") || { echo "space-clean: cannot resolve \$HOME" >&2; exit 1; }
 [[ -d "$HOME_REAL" && "$HOME_REAL" == /?*/?* ]] || { echo "space-clean: refusing to run with HOME=$HOME" >&2; exit 1; }
+# Paths built from $HOME must already be canonical for guard() to accept them.
+export HOME="$HOME_REAL"
 TRASH="${XDG_DATA_HOME:-$HOME/.local/share}/Trash"
 
 # id|tier|icon|label|description
@@ -58,7 +62,6 @@ TARGETS=(
   "aur-build|safe|󰣇|AUR build files|yay / paru clones and build folders"
   "thumbnails|safe|󰋩|Thumbnails|Image previews, regenerated on demand"
   "browser-cache|safe|󰖟|Browser caches|Web caches of closed browsers"
-  "playwright-old|safe|󰙨|Old Playwright browsers|Builds replaced by newer ones"
   "codex-old|safe|󰚩|Old Codex releases|Versions that are no longer current"
   "build-caches|safe|󰣪|Stale build output|.next, .turbo, target… in projects idle STALE+ days"
   "stale-deps|review|󰎙|Stale node_modules|Projects idle STALE+ days · npm install restores"
@@ -68,9 +71,11 @@ TARGETS=(
 )
 
 # Targets whose items can be picked one by one.
-SELECTABLE=" trash-old trash-all browser-cache playwright-old codex-old build-caches stale-deps stale-venvs "
+SELECTABLE=" trash-old trash-all browser-cache codex-old build-caches stale-deps stale-venvs "
 # Targets whose size is an upper bound rather than exact.
 ESTIMATE=" pnpm "
+# Targets that don't come back by themselves: gone for good or need a reinstall.
+NO_REBUILD=" trash-old trash-all stale-deps stale-venvs "
 PROJECT_TARGETS=" build-caches stale-deps stale-venvs "
 
 BUILD_NAMES=(.next .nuxt .svelte-kit .turbo .parcel-cache .angular target build)
@@ -91,30 +96,35 @@ log() {
 
 # Prints the resolved path when $1 is a real (non-symlink) directory strictly
 # inside $HOME, at least two levels deep. Fails otherwise.
+# The path must already be canonical, so a symlink in any part of it is refused.
 guard() {
-  local p="$1" real
+  local p="${1%/}" real
   [[ "$p" == /* ]] || return 1
   [[ -d "$p" && ! -L "$p" ]] || return 1
   real=$(realpath -e -- "$p" 2>/dev/null) || return 1
+  [[ "$real" == "$p" ]] || return 1
   [[ "$real" == "$HOME_REAL"/*/* ]] || return 1
   printf '%s' "$real"
 }
 
 remove_dir() {
   local real
-  real=$(guard "$1") || { echo "skip unsafe path: $1" >&2; return 1; }
+  real=$(guard "$1") || { echo "skip unsafe path: $1" >&2; return 0; }
   if ((DRY_RUN)); then echo "would remove $real"; return 0; fi
   log "rm $real"
-  rm -rf --one-file-system -- "$real"
+  rm -rf --one-file-system -- "$real" 2>/dev/null
+  [[ ! -e "$real" ]] || { echo "could not fully remove $(tilde "$real")" >&2; return 1; }
 }
 
 # Removes what is inside a directory but keeps the directory itself.
 empty_dir() {
   local real
-  real=$(guard "$1") || return 0
+  [[ -e "$1" ]] || return 0
+  real=$(guard "$1") || { echo "skip unsafe path: $1" >&2; return 0; }
   if ((DRY_RUN)); then echo "would empty $real"; return 0; fi
   log "empty $real"
-  find "$real" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+  find "$real" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2>/dev/null ||
+    { echo "could not fully empty $(tilde "$real")" >&2; return 1; }
 }
 
 remove_file() {
@@ -124,25 +134,39 @@ remove_file() {
   real="$dir/$(basename -- "$f")"
   if ((DRY_RUN)); then echo "would remove $real"; return 0; fi
   log "rm $real"
-  rm -f -- "$real"
+  rm -f -- "$real" 2>/dev/null || { echo "could not remove $(tilde "$real")" >&2; return 1; }
 }
 
-# Disk usage in KiB of the given paths (missing ones count as 0).
+# KiB that deleting the given paths would give back. A hardlinked file only
+# counts when all of its links are inside these paths.
 kb() {
-  local p total=0 n
+  local p
   for p in "$@"; do
     [[ -e "$p" || -L "$p" ]] || continue
-    n=$(du -sk --one-file-system -- "$p" 2>/dev/null | awk '{print $1}')
-    total=$((total + ${n:-0}))
-  done
-  echo "$total"
+    find "$p" -xdev -printf '%D:%i %n %b %y\n' 2>/dev/null
+  done | awk '
+    $4 != "f" || $2 == 1 { s += $3; next }
+    { seen[$1]++; links[$1] = $2; blocks[$1] = $3 }
+    END { for (i in seen) if (seen[i] >= links[i]) s += blocks[i]; printf "%d\n", s / 2 }'
 }
 
 # Runs a tool's own clean command, with a time limit so a held lock can't hang us.
 run_tool() {
+  local out
   if ((DRY_RUN)); then echo "would run $*"; return 0; fi
   log "run $*"
-  timeout 300 "$@" >/dev/null 2>&1
+  out=$(timeout 300 "$@" 2>&1) || { echo "$* failed: $(tail -n 1 <<<"$out")" >&2; return 1; }
+}
+
+# Tool commands clean wherever the tool is configured to. Only run them when
+# that place is inside $HOME, like everything else we delete.
+tool_dir_ok() {
+  local real
+  [[ -e "$1" ]] || return 1
+  real=$(realpath -e -- "$1" 2>/dev/null)
+  [[ "$real" == "${1%/}" && "$real" == "$HOME_REAL"/?* ]] && return 0
+  echo "skip $2: its cache $1 is outside your home" >&2
+  return 1
 }
 
 running() { pgrep -u "$UID" -x "$1" >/dev/null 2>&1; }
@@ -177,6 +201,9 @@ remove_trash_item() {
   local f="$1" name
   name=$(basename -- "$f")
   if [[ -d "$f" && ! -L "$f" ]]; then remove_dir "$f"; else remove_file "$f"; fi
+  ((DRY_RUN)) && return 0
+  # Keep the restore info while any of the file is still there.
+  [[ -e "$f" || -L "$f" ]] && { echo "kept restore info for $name" >&2; return 1; }
   remove_file "$TRASH/info/$name.trashinfo"
 }
 clean_item_trash-old() { remove_trash_item "$1"; }
@@ -219,26 +246,6 @@ clean_item_browser-cache() {
   done
 }
 
-# Playwright keeps <browser>-<build> dirs; keep the newest build of each.
-items_playwright-old() {
-  local root="$HOME/.cache/ms-playwright" d base name num
-  [[ -d "$root" ]] || return 0
-  declare -A newest=()
-  for d in "$root"/*/; do
-    name=$(basename -- "$d")
-    [[ "$name" =~ ^([a-z_]+)-([0-9]+)$ ]] || continue
-    base=${BASH_REMATCH[1]}; num=${BASH_REMATCH[2]}
-    (( num > ${newest[$base]:-0} )) && newest[$base]=$num
-  done
-  for d in "$root"/*/; do
-    name=$(basename -- "$d")
-    [[ "$name" =~ ^([a-z_]+)-([0-9]+)$ ]] || continue
-    base=${BASH_REMATCH[1]}; num=${BASH_REMATCH[2]}
-    (( num < ${newest[$base]} )) && printf '%s\t%s\tnewest is build %s\n' "${d%/}" "$name" "${newest[$base]}"
-  done
-}
-clean_item_playwright-old() { remove_dir "$1"; }
-
 # Codex keeps every release under packages/<channel>/releases and points
 # packages/<channel>/current at the live one. Keep current and anything running.
 items_codex-old() {
@@ -246,9 +253,9 @@ items_codex-old() {
   for chan in "$HOME"/.codex/packages/*/; do
     [[ -L "$chan/current" && -d "$chan/releases" ]] || continue
     cur=$(realpath -e -- "$chan/current" 2>/dev/null) || continue
-    for rel in "$chan"releases/*/; do
-      rel=$(realpath -e -- "$rel") || continue
-      [[ "$rel" == "$cur" ]] && continue
+    for rel in "$chan"releases/*; do
+      [[ -d "$rel" && ! -L "$rel" ]] || continue
+      [[ "$(realpath -e -- "$rel")" == "$cur" ]] && continue
       in_use "$rel" && continue
       printf '%s\t%s\t%s channel\n' "$rel" "$(basename -- "$rel" | cut -d- -f1)" "$(basename -- "$chan")"
     done
@@ -259,9 +266,16 @@ clean_item_codex-old() { remove_dir "$1"; }
 # ---------------------------------------------------------------------------
 # Tool-command targets: measured by their cache dirs, cleaned by the tool.
 
-size_npm() { kb "$HOME/.npm/_cacache"; }
+npm_cache() {
+  local dir=""
+  have npm && dir=$(timeout 20 npm config get cache 2>/dev/null)
+  echo "${dir:-$HOME/.npm}"
+}
+size_npm() { kb "$(npm_cache)/_cacache"; }
 clean_npm() {
-  if have npm; then run_tool npm cache clean --force; else empty_dir "$HOME/.npm/_cacache"; fi
+  local dir; dir=$(npm_cache)
+  tool_dir_ok "$dir" npm || return 0
+  if have npm; then run_tool npm cache clean --force; else empty_dir "$dir/_cacache"; fi
 }
 
 pnpm_store() { have pnpm && timeout 20 pnpm store path 2>/dev/null; }
@@ -271,7 +285,9 @@ size_pnpm() {
   if [[ -n "$store" ]]; then kb "$store" "$HOME/.cache/pnpm"; else kb "$HOME/.cache/pnpm"; fi
 }
 clean_pnpm() {
-  have pnpm && run_tool pnpm store prune
+  local store
+  store=$(pnpm_store) || store=""
+  if [[ -n "$store" ]] && tool_dir_ok "$store" pnpm; then run_tool pnpm store prune || return 1; fi
   empty_dir "$HOME/.cache/pnpm"
 }
 
@@ -281,7 +297,11 @@ bun_cache() {
   [[ -n "$dir" && -d "$dir" ]] && echo "$dir"
 }
 size_bun() { local d; d=$(bun_cache) && kb "$d" || echo 0; }
-clean_bun() { [[ -n "$(bun_cache)" ]] && run_tool bun pm cache rm; true; }
+clean_bun() {
+  local dir; dir=$(bun_cache) || return 0
+  tool_dir_ok "$dir" bun || return 0
+  run_tool bun pm cache rm
+}
 
 uv_cache() {
   local dir=""
@@ -290,7 +310,9 @@ uv_cache() {
 }
 size_uv() { kb "$(uv_cache)"; }
 clean_uv() {
-  if have uv; then run_tool uv cache clean; else empty_dir "$(uv_cache)"; fi
+  local dir; dir=$(uv_cache)
+  tool_dir_ok "$dir" uv || return 0
+  if have uv; then run_tool uv cache clean; else empty_dir "$dir"; fi
 }
 
 size_pip() { kb "$HOME/.cache/pip"; }
@@ -298,12 +320,22 @@ clean_pip() { empty_dir "$HOME/.cache/pip"; }
 
 go_env() { have go && go env "$1" 2>/dev/null; }
 size_go-build() { local d; d=$(go_env GOCACHE) && kb "$d" || echo 0; }
-clean_go-build() { have go && run_tool go clean -cache; true; }
+clean_go-build() {
+  local dir; dir=$(go_env GOCACHE) || return 0
+  tool_dir_ok "$dir" go || return 0
+  run_tool go clean -cache
+}
 size_go-mod() { local d; d=$(go_env GOMODCACHE) && kb "$d" || echo 0; }
-clean_go-mod() { have go && run_tool go clean -modcache; true; }
+clean_go-mod() {
+  local dir; dir=$(go_env GOMODCACHE) || return 0
+  tool_dir_ok "$dir" go || return 0
+  run_tool go clean -modcache
+}
 
 # mise prune keeps every version a tracked config still asks for. Its dry run
 # prints "mise <tool>@<version> [dryrun] remove <dir>" for each one it would drop.
+MISE_DATA="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+MISE_CACHE="${MISE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/mise}"
 mise_prunable() {
   have mise || return 0
   mise prune --dry-run 2>&1 | sed -n 's/^mise \([^ ]*\) \[dryrun\] *remove \(.*\)$/\1\t\2/p' |
@@ -311,7 +343,7 @@ mise_prunable() {
 }
 size_mise() {
   local total spec dir
-  total=$(kb "$HOME/.cache/mise")
+  total=$(kb "$MISE_CACHE")
   while IFS=$'\t' read -r spec dir; do total=$((total + $(kb "$dir"))); done < <(mise_prunable)
   echo "$total"
 }
@@ -319,12 +351,14 @@ size_mise() {
 info_mise() {
   local spec dir
   while IFS=$'\t' read -r spec dir; do printf '%s\t%s\tunused version\n' "$dir" "$spec"; done < <(mise_prunable)
-  [[ -d "$HOME/.cache/mise" ]] && printf '%s\t%s\t%s\n' "$HOME/.cache/mise" "download cache" "~/.cache/mise"
+  [[ -d "$MISE_CACHE" ]] && printf '%s\t%s\t%s\n' "$MISE_CACHE" "download cache" "$(tilde "$MISE_CACHE")"
 }
 clean_mise() {
+  local ok=0
   have mise || return 0
-  run_tool mise prune --yes
-  run_tool mise cache clear
+  if tool_dir_ok "$MISE_DATA" mise; then run_tool mise prune --yes || ok=1; fi
+  if tool_dir_ok "$MISE_CACHE" mise; then run_tool mise cache clear || ok=1; fi
+  return $ok
 }
 
 aur_dirs() { echo "$HOME/.cache/yay"; echo "$HOME/.cache/paru/clone"; }
@@ -333,7 +367,9 @@ clean_aur-build() {
   if running yay || running paru || running makepkg; then
     echo "skip AUR build files: an AUR helper is running" >&2; return 0
   fi
-  local d; while IFS= read -r d; do empty_dir "$d"; done < <(aur_dirs)
+  local d ok=0
+  while IFS= read -r d; do empty_dir "$d" || ok=1; done < <(aur_dirs)
+  return $ok
 }
 
 size_thumbnails() { kb "$HOME/.cache/thumbnails"; }
@@ -384,21 +420,43 @@ for n in "${BUILD_NAMES[@]}" "${DEP_NAMES[@]}" "${VENV_NAMES[@]}" .git; do
 done
 unset 'ARTIFACT_PRUNE[-1]'
 
-# True when anything in the project was modified within STALE_DAYS, or a
-# process is running inside it.
-project_active() {
-  local scope="$1"
-  in_use "$scope" && return 0
-  [[ -f "$scope/.git/index" ]] && [[ -n $(find "$scope/.git/index" -mtime "-$STALE_DAYS" 2>/dev/null) ]] && return 0
-  [[ -n $(find "$scope" -maxdepth 6 \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type f -mtime "-$STALE_DAYS" -print -quit 2>/dev/null) ]]
+# This checkout's git index. A linked worktree keeps it in the main repo.
+git_index() {
+  local scope="$1" idx
+  [[ -e "$scope/.git" ]] || return 1
+  if have git; then
+    idx=$(git -C "$scope" rev-parse --git-path index 2>/dev/null) || return 1
+    [[ "$idx" == /* ]] || idx="$scope/$idx"
+  else
+    idx="$scope/.git/index"
+  fi
+  [[ -f "$idx" ]] && echo "$idx"
 }
 
-# Days since anything in the project last changed.
-project_idle_days() {
-  local scope="$1" newest
-  newest=$( { find "$scope" -maxdepth 6 \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type f -printf '%T@\n' 2>/dev/null
-              [[ -f "$scope/.git/index" ]] && stat -c %Y "$scope/.git/index"; } | sort -n | tail -1)
-  days_since "${newest:-0}"
+# Newest change in the project as epoch seconds: its files, the targets of
+# its symlinks and its git index. Build output folders don't count.
+project_newest() {
+  local scope="$1" idx
+  {
+    find "$scope" -xdev \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type f -printf '%T@\n' 2>/dev/null
+    find "$scope" -xdev \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type l -print0 2>/dev/null |
+      xargs -0r stat -L -c %Y 2>/dev/null
+    idx=$(git_index "$scope") && stat -c %Y "$idx"
+  } | sort -n | tail -n 1
+}
+
+# Succeeds, printing the last change time, when nothing runs inside the
+# project and nothing in it changed for STALE_DAYS.
+project_stale() {
+  local scope="$1" newest cutoff
+  in_use "$scope" && return 1
+  # Fast path for busy projects: any recent plain file settles it.
+  [[ -n $(find "$scope" -xdev \( "${ARTIFACT_PRUNE[@]}" \) -prune -o -type f -mtime "-$STALE_DAYS" -print -quit 2>/dev/null) ]] && return 1
+  cutoff=$(date -d "-$STALE_DAYS days" +%s)
+  newest=$(project_newest "$scope")
+  newest=${newest%.*}
+  (( ${newest:-0} < cutoff )) || return 1
+  echo "${newest:-0}"
 }
 
 any_file() { local d="$1" f; shift; for f in "$@"; do compgen -G "$d/$f" >/dev/null && return 0; done; return 1; }
@@ -444,7 +502,7 @@ ignored() {
 PROJECT_CACHE=""
 project_artifacts() {
   if [[ -z "$PROJECT_CACHE" ]]; then
-    local names=() n root dir real cat parent scope
+    local names=() n root dir real cat parent newest
     for n in "${BUILD_NAMES[@]}" "${DEP_NAMES[@]}" "${VENV_NAMES[@]}"; do names+=(-name "$n" -o); done
     unset 'names[-1]'
     PROJECT_CACHE=$(
@@ -461,9 +519,8 @@ project_artifacts() {
         cat=$(classify "$real") || continue
         parent=$(dirname -- "$real")
         ignored "$parent" && continue
-        scope=$(project_scope "$parent")
-        project_active "$scope" && continue
-        printf '%s\t%s\t%s\t%s\n' "$cat" "$real" "$parent" "$(project_idle_days "$scope")"
+        newest=$(project_stale "$(project_scope "$parent")") || continue
+        printf '%s\t%s\t%s\t%s\n' "$cat" "$real" "$parent" "$(days_since "$newest")"
       done
     )
     PROJECT_CACHE+=$'\n'
@@ -479,9 +536,20 @@ project_items() {
 items_build-caches() { project_items build-caches; }
 items_stale-deps() { project_items stale-deps; }
 items_stale-venvs() { project_items stale-venvs; }
-clean_item_build-caches() { remove_dir "$1"; }
-clean_item_stale-deps() { remove_dir "$1"; }
-clean_item_stale-venvs() { remove_dir "$1"; }
+# The scan may be minutes old by now, so check the project again first.
+clean_project_item() {
+  local dir="$1" parent
+  parent=$(dirname -- "$dir")
+  PROC_PATHS=""
+  if ! classify "$dir" >/dev/null || ignored "$parent" || ! project_stale "$(project_scope "$parent")" >/dev/null; then
+    echo "skip $(tilde "$parent"): it changed since the scan" >&2
+    return 0
+  fi
+  remove_dir "$dir"
+}
+clean_item_build-caches() { clean_project_item "$1"; }
+clean_item_stale-deps() { clean_project_item "$1"; }
+clean_item_stale-venvs() { clean_project_item "$1"; }
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -535,9 +603,10 @@ cmd_scan() {
         --arg id "$id" --arg tier "$tier" --arg icon "$icon" --arg label "$label" --arg desc "$desc" \
         --arg note "$note" --argjson kb "$size" --argjson count "$count" \
         --argjson selectable "$(selectable "$id" && echo true || echo false)" \
-        --argjson estimate "$([[ "$ESTIMATE" == *" $id "* ]] && echo true || echo false)" '
+        --argjson estimate "$([[ "$ESTIMATE" == *" $id "* ]] && echo true || echo false)" \
+        --argjson rebuilds "$([[ "$NO_REBUILD" == *" $id "* ]] && echo false || echo true)" '
         { id: $id, tier: $tier, icon: $icon, label: $label, description: $desc, note: $note,
-          kb: $kb, count: $count, selectable: $selectable, estimate: $estimate,
+          kb: $kb, count: $count, selectable: $selectable, estimate: $estimate, rebuilds: $rebuilds,
           items: [inputs | select(length > 0) | split("\t") | { kb: (.[0] | tonumber), path: .[1], label: .[2], meta: .[3] }] }')")
     else
       printf '%-15s %-7s %8s  %s\n' "$id" "$tier" "$(numfmt --to=iec --from-unit=1024 "$size")" "$label"
@@ -556,7 +625,7 @@ cmd_scan() {
 
 cmd_clean() {
   (($#)) || die "clean: no target ids given (see: space-clean list)"
-  local arg id path list order=() before after freed total=0 projects=0
+  local arg id path list order=() before after freed total=0 projects=0 ok failed=0
   declare -A picked=()
   for arg in "$@"; do
     id=${arg%%=*}
@@ -578,6 +647,7 @@ cmd_clean() {
   for id in "${order[@]}"; do
     echo "start $id"
     freed=0
+    ok=1
     if selectable "$id"; then
       # Only what we discover ourselves, narrowed by the caller's picks.
       list=$("items_$id" | cut -f1)
@@ -585,7 +655,7 @@ cmd_clean() {
         [[ -n "$path" ]] || continue
         if [[ -n "${picked[$id]-}" ]] && ! grep -qxF -- "$path" <<<"${picked[$id]}"; then continue; fi
         before=$(kb "$path")
-        "clean_item_$id" "$path"
+        "clean_item_$id" "$path" || ok=0
         ((DRY_RUN)) && continue
         after=$(kb "$path")
         freed=$((freed + (before > after ? before - after : 0)))
@@ -593,16 +663,19 @@ cmd_clean() {
       [[ -z "${picked[$id]-}" ]] && declare -F "after_clean_$id" >/dev/null && "after_clean_$id"
     else
       before=$("size_$id" 2>/dev/null) || before=0
-      "clean_$id"
+      "clean_$id" || ok=0
       ((DRY_RUN)) && continue
       after=$("size_$id" 2>/dev/null) || after=0
       freed=$(( before > after ? before - after : 0 ))
     fi
     ((DRY_RUN)) && continue
-    echo "cleaned $id $freed"
+    if ((ok)); then echo "cleaned $id $freed"; else echo "failed $id $freed"; failed=1; fi
     total=$((total + freed))
   done
-  ((DRY_RUN)) || { echo "total $total"; log "clean done: freed ${total}K"; }
+  ((DRY_RUN)) && return 0
+  echo "total $total"
+  log "clean done: freed ${total}K$( ((failed)) && echo ', with failures')"
+  return $failed
 }
 
 cmd_ignore() {
@@ -725,6 +798,10 @@ done
 
 [[ "$STALE_DAYS" =~ ^[0-9]+$ ]] && ((STALE_DAYS >= 7)) || die "--stale-days must be a number >= 7"
 ROOTS=${ROOTS//\~/$HOME}
+roots=()
+IFS=':' read -ra _roots <<<"$ROOTS"
+for r in "${_roots[@]}"; do r=$(realpath -e -- "$r" 2>/dev/null) && roots+=("$r"); done
+ROOTS=$(IFS=':'; echo "${roots[*]-}")
 
 cmd="${args[0]:-scan}"
 case "$cmd" in

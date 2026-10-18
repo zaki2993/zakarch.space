@@ -18,7 +18,7 @@ Panel {
   manageIpc: false
 
   readonly property string script: decodeURIComponent(String(Qt.resolvedUrl("bin/space-clean")).replace(/^file:\/\//, ""))
-  readonly property string logPath: Quickshell.env("HOME") + "/.local/state/space-clean/clean.log"
+  readonly property string logPath: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/space-clean/clean.log"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -71,7 +71,15 @@ Panel {
 
   readonly property double selectedKb: {
     var total = 0
-    for (var i = 0; i < visibleTargets.length; i++) total += pickedKb(visibleTargets[i])
+    var counted = {}
+    for (var i = 0; i < visibleTargets.length; i++) {
+      var t = visibleTargets[i]
+      if (!t.selectable) { if (sel[t.id]) total += t.kb; continue }
+      for (var j = 0; j < t.items.length; j++) {
+        var it = t.items[j]
+        if (sel[itemKey(t, it)] && !counted[it.path]) { counted[it.path] = true; total += it.kb }
+      }
+    }
     return total
   }
   readonly property var cleanArgs: {
@@ -88,7 +96,7 @@ Panel {
     return args
   }
   readonly property var pickedTargets: visibleTargets.filter(function(t) { return pickedKb(t) > 0 })
-  readonly property int pickedReviewCount: pickedTargets.filter(function(t) { return t.tier === "review" }).length
+  readonly property var pickedLost: pickedTargets.filter(function(t) { return t.rebuilds === false })
 
   // Flattened rows for the list and the keyboard cursor.
   readonly property var rows: {
@@ -99,8 +107,10 @@ Panel {
       for (var i = 0; i < list.length; i++) {
         var t = list[i]
         out.push({ kind: "target", target: t })
-        if (expanded[t.id])
+        if (expanded[t.id]) {
           for (var j = 0; j < t.items.length; j++) out.push({ kind: "item", target: t, item: t.items[j] })
+          if (t.count > t.items.length) out.push({ kind: "more", target: t })
+        }
       }
     }
     section("safe", "Safe to clean", safeTargets)
@@ -308,7 +318,7 @@ Panel {
   function moveCursor(dy) {
     if (rows.length === 0) return
     var i = cursor < 0 ? (dy > 0 ? -1 : rows.length) : cursor
-    do { i += dy } while (i >= 0 && i < rows.length && rows[i].kind === "header")
+    do { i += dy } while (i >= 0 && i < rows.length && (rows[i].kind === "header" || rows[i].kind === "more"))
     if (i >= 0 && i < rows.length) cursor = i
     scrollToCursor()
   }
@@ -385,18 +395,18 @@ Panel {
       onRead: function(line) {
         var parts = String(line).trim().split(/\s+/)
         if (parts[0] === "start") root.cleanCurrent = root.labelOf(parts[1])
-        else if (parts[0] === "cleaned") root.cleanDone++
+        else if (parts[0] === "cleaned" || parts[0] === "failed") root.cleanDone++
         else if (parts[0] === "total") root.freedKb = Number(parts[1]) || 0
       }
     }
     stderr: StdioCollector { id: cleanErr }
     onExited: function(code) {
       var err = String(cleanErr.text).trim()
-      if (code === 0) {
-        root.showResult("Freed " + root.human(root.freedKb) + (err !== "" ? ". " + err.split("\n").pop() : ""), false)
-      } else {
-        root.showResult("Cleanup failed: " + (err || ("exit " + code)), true)
-      }
+      var last = err.split("\n").pop()
+      if (code === 0)
+        root.showResult("Freed " + root.human(root.freedKb) + (last !== "" ? ". " + last : ""), false)
+      else
+        root.showResult("Freed " + root.human(root.freedKb) + ", but some items failed: " + (last || ("exit " + code)), true)
       root.cleanCurrent = ""
       root.refreshDisk()
       // The process still reports running inside its own exit handler.
@@ -481,7 +491,10 @@ Panel {
         if (root.confirmOpen) root.confirmOpen = false
         else root.close()
       }
-      onTabRequested: function(direction) { if (!root.confirmOpen) root.switchPanel(direction) }
+      onTabRequested: function(direction) {
+        if (root.confirmOpen) confirm.selectedIndex = confirm.selectedIndex === 0 ? 1 : 0
+        else root.switchPanel(direction)
+      }
       onTextKey: function(t) {
         if (root.confirmOpen) return
         var r = root.cursorRow()
@@ -644,11 +657,13 @@ Panel {
                 required property int index
                 width: listColumn.width
                 sourceComponent: modelData.kind === "header" ? headerComp
-                  : modelData.kind === "target" ? targetComp : itemComp
+                  : modelData.kind === "target" ? targetComp
+                  : modelData.kind === "more" ? moreComp : itemComp
 
                 Component { id: headerComp; SectionHeader { row: rowLoader.modelData } }
                 Component { id: targetComp; TargetRow { row: rowLoader.modelData; rowIndex: rowLoader.index } }
                 Component { id: itemComp; ItemRow { row: rowLoader.modelData; rowIndex: rowLoader.index } }
+                Component { id: moreComp; MoreRow { row: rowLoader.modelData } }
               }
             }
 
@@ -699,8 +714,9 @@ Panel {
         z: 10
         opened: root.confirmOpen
         message: "Free up " + root.human(root.selectedKb) + " from " + root.plural(root.pickedTargets.length, "target") + "?"
-          + (root.pickedReviewCount > 0
-            ? " " + root.plural(root.pickedReviewCount, "review target") + " will need a reinstall or can't be recovered."
+          + (root.pickedLost.length > 0
+            ? " Can't be undone, and won't come back by itself: "
+              + root.pickedLost.map(function(t) { return t.label }).join(", ") + "."
             : " Everything picked rebuilds itself.")
         confirmText: "Delete"
         foreground: root.foreground
@@ -918,6 +934,20 @@ Panel {
         horizontalAlignment: Text.AlignHCenter
       }
     }
+  }
+
+  component MoreRow: Text {
+    property var row: ({})
+    readonly property var t: row.target || ({})
+    textFormat: Text.PlainText
+    leftPadding: Style.space(34)
+    topPadding: Style.space(4)
+    bottomPadding: Style.space(6)
+    wrapMode: Text.WordWrap
+    text: "Showing the largest " + (t.items || []).length + " of " + t.count + ". Clean the rest from the terminal: space-clean clean " + t.id
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
   }
 
   component ItemRow: CursorSurface {
