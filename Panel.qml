@@ -452,13 +452,20 @@ Panel {
     bar: root.bar
     readonly property bool withLabel: root.showFreeSpace && !(root.bar && root.bar.vertical) && root.diskSize > 0
     text: withLabel ? "󰋊 " + root.gb(root.diskAvail) + "G" : "󰋊"
-    iconComponent: withLabel ? emptyIcon : null
+    iconComponent: withLabel ? emptyIcon : diskIcon
     labelVisible: withLabel
     fontSize: withLabel ? Style.font.body : Style.bar.iconFont
     fixedWidth: vertical || withLabel ? -1 : slotSize
     foreground: root.low ? root.urgent : root.barForeground
 
     Component { id: emptyIcon; Item {} }
+    Component {
+      id: diskIcon
+      DiskIcon {
+        used: root.diskSize > 0 ? root.diskUsed / root.diskSize : 0
+        color: button.foreground
+      }
+    }
     tooltipText: root.diskSize > 0 ? root.gb(root.diskAvail) + " GB free of " + root.gb(root.diskSize) + " GB" : "Disk space"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.refreshDisk()
