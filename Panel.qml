@@ -444,13 +444,21 @@ Panel {
     }
   }
 
-  WidgetButton {
+  // Same icon slot as the stock bar icons; with the free space shown it falls
+  // back to a plain text label (the empty iconComponent hides the glyph).
+  BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     readonly property bool withLabel: root.showFreeSpace && !(root.bar && root.bar.vertical) && root.diskSize > 0
     text: withLabel ? "󰋊 " + root.gb(root.diskAvail) + "G" : "󰋊"
+    iconComponent: withLabel ? emptyIcon : null
+    labelVisible: withLabel
+    fontSize: withLabel ? Style.font.body : Style.bar.iconFont
+    fixedWidth: vertical || withLabel ? -1 : slotSize
     foreground: root.low ? root.urgent : root.barForeground
+
+    Component { id: emptyIcon; Item {} }
     tooltipText: root.diskSize > 0 ? root.gb(root.diskAvail) + " GB free of " + root.gb(root.diskSize) + " GB" : "Disk space"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.refreshDisk()
